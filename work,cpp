@@ -1,0 +1,998 @@
+#define _USE_MATH_DEFINES
+#define GL_SILENCE_DEPRECATION
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cctype>
+#include <vector>
+#include <algorithm>
+#ifdef __APPLE__
+#include <GLUT/glut.h>
+#else
+#include <GL/glut.h>
+#include <GL/glu.h>
+#endif
+
+// ---------------------------------------------------------------- constants
+static const float PI  = 3.14159265f;
+static const float DEG = PI / 180.0f;
+
+// ------------------------------------------------------------------ globals
+static int   winW = 1280, winH = 720;
+static GLUquadric* Q = nullptr;
+
+// camera
+static float camX = 0, camZ = 52, eyeH = 1.7f, yaw = 0, pitch = -3;
+static bool  keys[256] = {false};
+static bool  sKeys[4]  = {false};            // left, right, up, down
+static bool  shiftHeld = false, mouseLook = false, warping = false, showHelp = true, fullScr = false;
+static float scrollV = 0;
+
+// world state
+static bool  paused = false, nightTarget = true, carnivalOpen = true;
+static float night = 1.0f;                   // 0 = day, 1 = night (smoothly blended)
+static float power = 1.0f;                   // 1 = running, 0 = shut down
+static float gateAng = 100.0f;               // 0 = closed, 100 = fully open
+static float animT = 0, ferrisAng = 0, carAng = 0, balloonT = 0, closeTimer = 0;
+static float lamp = 1.0f, glowLevel = 1.0f;  // light intensity helpers
+static int   lastMs = 0;
+static GLuint staticList = 0;
+
+// --------------------------------------------------------------- utilities
+static float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+static float mixf(float a, float b, float t) { return a + (b - a) * t; }
+static float frand(float a, float b) { return a + (b - a) * (rand() / (float)RAND_MAX); }
+static float smooth(float t) { t = clamp01(t); return t * t * (3 - 2 * t); }
+
+static void col(float r, float g, float b) { glColor3f(r, g, b); }
+static void colv(const float* c) { glColor3f(c[0], c[1], c[2]); }
+
+static void box(float cx, float cy, float cz, float sx, float sy, float sz) {
+    glPushMatrix(); glTranslatef(cx, cy, cz); glScalef(sx, sy, sz); glutSolidCube(1.0); glPopMatrix();
+}
+static void sphere(float x, float y, float z, float r, int sl = 16, int st = 12) {
+    glPushMatrix(); glTranslatef(x, y, z); glutSolidSphere(r, sl, st); glPopMatrix();
+}
+// vertical cylinder (base at y), with a top cap
+static void upCyl(float x, float y, float z, float r1, float r2, float h, int sl = 16, bool cap = true) {
+    glPushMatrix(); glTranslatef(x, y, z); glRotatef(-90, 1, 0, 0);
+    gluCylinder(Q, r1, r2, h, sl, 1);
+    if (cap) { glTranslatef(0, 0, h); gluDisk(Q, 0, r2, sl, 1); }
+    glPopMatrix();
+}
+// cylinder between two points
+static void beam(float x1, float y1, float z1, float x2, float y2, float z2, float r) {
+    float dx = x2 - x1, dy = y2 - y1, dz = z2 - z1;
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-4f) return;
+    glPushMatrix(); glTranslatef(x1, y1, z1);
+    float ax = -dy, ay = dx;
+    if (fabsf(ax) + fabsf(ay) > 1e-5f) glRotatef(acosf(dz / len) / DEG, ax, ay, 0);
+    else if (dz < 0) glRotatef(180, 1, 0, 0);
+    gluCylinder(Q, r, r, len, 8, 1);
+    glPopMatrix();
+}
+
+// ------------------------------------------------- glowing bulbs (halo pass)
+struct Glow { float x, y, z, r, g, b, s; };
+static std::vector<Glow> glows;
+
+static void addGlow(float x, float y, float z, float r, float g, float b, float s) {
+    float m[16]; glGetFloatv(GL_MODELVIEW_MATRIX, m);
+    Glow gl;
+    gl.x = m[0] * x + m[4] * y + m[8]  * z + m[12];
+    gl.y = m[1] * x + m[5] * y + m[9]  * z + m[13];
+    gl.z = m[2] * x + m[6] * y + m[10] * z + m[14];
+    gl.r = r; gl.g = g; gl.b = b; gl.s = s;
+    glows.push_back(gl);
+}
+static void bulb(float x, float y, float z, float r, float g, float b, float s = 0.12f) {
+    float k = 0.10f + 0.90f * lamp;
+    glDisable(GL_LIGHTING);
+    glColor3f(r * k, g * k, b * k);
+    sphere(x, y, z, s, 6, 6);
+    glEnable(GL_LIGHTING);
+    if (glowLevel > 0.05f) addGlow(x, y, z, r, g, b, s);
+}
+static void drawGlows() {
+    glDisable(GL_LIGHTING); glDisable(GL_FOG);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glDepthMask(GL_FALSE); glEnable(GL_POINT_SMOOTH);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    float K = winH * 0.5f / tanf(32.5f * DEG);
+    for (size_t i = 0; i < glows.size(); i++) {
+        const Glow& g = glows[i];
+        float depth = -g.z;
+        if (depth < 0.3f) continue;
+        float px = 2.0f * g.s * 4.5f * K / depth;
+        if (px > 70) px = 70;
+        if (px < 2) px = 2;
+        float a = glowLevel;
+        glPointSize(px);        glColor4f(g.r, g.g, g.b, 0.09f * a); glBegin(GL_POINTS); glVertex3f(g.x, g.y, g.z); glEnd();
+        glPointSize(px * 0.5f); glColor4f(g.r, g.g, g.b, 0.20f * a); glBegin(GL_POINTS); glVertex3f(g.x, g.y, g.z); glEnd();
+        glPointSize(px * 0.2f); glColor4f(1, 1, 1, 0.35f * a);       glBegin(GL_POINTS); glVertex3f(g.x, g.y, g.z); glEnd();
+    }
+    glPopMatrix();
+    glDisable(GL_POINT_SMOOTH); glDepthMask(GL_TRUE); glDisable(GL_BLEND);
+}
+
+// ------------------------------------------------------------ stroke text
+static void signText(const char* s, float w, float h, float r, float g, float b) {
+    float len = (float)glutStrokeLength(GLUT_STROKE_ROMAN, (const unsigned char*)s);
+    float sc = std::min(w / len, h / 119.0f);
+    float k = 0.35f + 0.65f * lamp;
+    glDisable(GL_LIGHTING);
+    glColor3f(r * k, g * k, b * k);
+    glLineWidth(2.5f);
+    glPushMatrix();
+    glTranslatef(-len * sc * 0.5f, -59.0f * sc, 0);
+    glScalef(sc, sc, sc);
+    for (const char* p = s; *p; p++) glutStrokeCharacter(GLUT_STROKE_ROMAN, *p);
+    glPopMatrix();
+    glLineWidth(1);
+    glEnable(GL_LIGHTING);
+}
+
+// ------------------------------------------------------------ palette
+static const float PAL[8][3] = {
+    {0.92f, 0.20f, 0.25f}, {1.00f, 0.55f, 0.10f}, {1.00f, 0.85f, 0.15f}, {0.20f, 0.75f, 0.35f},
+    {0.10f, 0.70f, 0.78f}, {0.22f, 0.42f, 0.92f}, {0.62f, 0.32f, 0.88f}, {1.00f, 0.42f, 0.72f}};
+static const float SKIN[4][3] = {{0.96f, 0.80f, 0.69f}, {0.85f, 0.65f, 0.50f}, {0.65f, 0.45f, 0.32f}, {0.45f, 0.30f, 0.20f}};
+
+// ------------------------------------------------------------ obstacles
+struct V2 { float x, z; };
+static std::vector<V2> trees;
+
+struct Shop { float x, z, rot; const char* name; int c; };
+static Shop shops[12] = {
+    {-10, 16, 90, "TICKETS", 0},  {-10, 6, 90, "POPCORN", 1},  {-10, -4, 90, "CANDY", 7},
+    {-10, -14, 90, "GAMES", 5},   {-10, -24, 90, "ICE CREAM", 4}, {-10, -34, 90, "TOYS", 6},
+    {10, 16, -90, "PIZZA", 1},    {10, 6, -90, "LEMONADE", 2}, {10, -4, -90, "DONUTS", 7},
+    {10, -14, -90, "PRIZES", 3},  {10, -24, -90, "CHURROS", 0}, {10, -34, -90, "BALLOONS", 5}};
+
+static const float CAR_X = -24, CAR_Z = -48;     // carousel
+static const float FER_X = 26,  FER_Z = -56;     // ferris wheel
+static const float TENT_Z = -74;                 // big top
+
+static bool solid(float x, float z, float ox, float oz) {
+    float ax = fabsf(x);
+    // perimeter fence
+    if (ax > 33.4f && ax < 34.6f && z < 25.5f && z > -89.6f) return true;
+    if (z < -88.4f && z > -89.6f && ax < 34.6f) return true;
+    if (fabsf(z - 25) < 0.5f && ax > 5.6f && ax < 34.6f) return true;
+    // gate doors when closed (only blocks people trying to cross, never traps someone)
+    if (gateAng < 60 && ax < 5.7f && fabsf(z - 25) < 0.7f && !(fabsf(oz - 25) < 0.7f)) return true;
+    // shops
+    for (int i = 0; i < 12; i++)
+        if (fabsf(z - shops[i].z) < 3.4f && ax > 6.9f && ax < 12.3f) return true;
+    // carousel, ferris legs, big top
+    if (hypotf(x - CAR_X, z - CAR_Z) < 8.5f) return true;
+    for (int a = -1; a <= 1; a += 2) for (int b = -1; b <= 1; b += 2)
+        if (hypotf(x - (FER_X + a * 3.5f), z - (FER_Z + b * 9.0f)) < 1.2f) return true;
+    if (hypotf(x, z - TENT_Z) < 10.8f) return true;
+    // lamp poles and trees
+    for (size_t i = 0; i < trees.size(); i++)
+        if (hypotf(x - trees[i].x, z - trees[i].z) < 0.9f) return true;
+    (void)ox;
+    return false;
+}
+
+// ------------------------------------------------------------ static scene
+static void fenceLine(float x1, float z1, float x2, float z2) {
+    float dx = x2 - x1, dz = z2 - z1, len = sqrtf(dx * dx + dz * dz);
+    int n = (int)(len / 1.5f);
+    col(0.93f, 0.93f, 0.96f);
+    for (int i = 0; i <= n; i++) {
+        float t = i / (float)n;
+        box(x1 + dx * t, 0.7f, z1 + dz * t, 0.14f, 1.4f, 0.14f);
+        sphere(x1 + dx * t, 1.45f, z1 + dz * t, 0.1f, 6, 6);
+    }
+    glPushMatrix();
+    glTranslatef((x1 + x2) / 2, 0, (z1 + z2) / 2);
+    glRotatef(atan2f(-dz, dx) / DEG, 0, 1, 0);
+    box(0, 0.5f, 0, len, 0.1f, 0.07f);
+    box(0, 1.0f, 0, len, 0.1f, 0.07f);
+    glPopMatrix();
+}
+
+static void drawTree(float x, float z, float s, int kind) {
+    col(0.35f, 0.22f, 0.12f);
+    upCyl(x, 0, z, 0.28f * s, 0.2f * s, 2.6f * s, 8);
+    if (kind == 1) {
+        col(0.08f, 0.33f, 0.2f);
+        for (int i = 0; i < 3; i++) {
+            glPushMatrix(); glTranslatef(x, (1.8f + i * 1.3f) * s, z); glRotatef(-90, 1, 0, 0);
+            glutSolidCone((2.0f - i * 0.5f) * s, 2.4f * s, 10, 2); glPopMatrix();
+        }
+    } else {
+        float g = frand(0.8f, 1.15f);
+        if (kind == 2) col(0.95f, 0.62f, 0.78f); else col(0.12f * g, 0.46f * g, 0.16f * g);
+        sphere(x, 3.6f * s, z, 1.7f * s, 12, 10);
+        sphere(x + 0.9f * s, 3.2f * s, z + 0.3f * s, 1.2f * s, 10, 8);
+        sphere(x - 0.8f * s, 3.3f * s, z - 0.4f * s, 1.2f * s, 10, 8);
+    }
+}
+
+static void buildStatic() {
+    srand(1234);
+    staticList = glGenLists(1);
+    glNewList(staticList, GL_COMPILE);
+
+    // --- grass (10 x 10 tiles with slight colour variation)
+    glBegin(GL_QUADS);
+    glNormal3f(0, 1, 0);
+    for (int i = -30; i < 30; i++)
+        for (int j = -30; j < 30; j++) {
+            float v = frand(-0.035f, 0.035f) + (((i + j) & 1) ? 0.02f : 0);
+            glColor3f(0.14f + v, 0.42f + v, 0.17f + v);
+            glVertex3f(i * 10.0f, 0, j * 10.0f);       glVertex3f(i * 10.0f, 0, j * 10.0f + 10);
+            glVertex3f(i * 10.0f + 10, 0, j * 10.0f + 10); glVertex3f(i * 10.0f + 10, 0, j * 10.0f);
+        }
+    glEnd();
+
+    // --- stone main path (2x2 tiles) from outside the gate to the big top
+    glBegin(GL_QUADS);
+    glNormal3f(0, 1, 0);
+    for (int i = -2; i < 2; i++)
+        for (int j = -31; j < 30; j++) {
+            float v = ((i + j) & 1) ? 0.05f : 0.0f;
+            glColor3f(0.64f - v, 0.57f - v, 0.46f - v);
+            glVertex3f(i * 2.0f, 0.03f, j * 2.0f);          glVertex3f(i * 2.0f, 0.03f, j * 2.0f + 2);
+            glVertex3f(i * 2.0f + 2, 0.03f, j * 2.0f + 2);  glVertex3f(i * 2.0f + 2, 0.03f, j * 2.0f);
+        }
+    glEnd();
+    // side paths to the rides
+    glBegin(GL_QUADS);
+    glNormal3f(0, 1, 0);
+    col(0.60f, 0.53f, 0.43f);
+    glVertex3f(-16, 0.032f, CAR_Z - 2); glVertex3f(-16, 0.032f, CAR_Z + 2); glVertex3f(-4, 0.032f, CAR_Z + 2); glVertex3f(-4, 0.032f, CAR_Z - 2);
+    glVertex3f(4, 0.032f, FER_Z - 2);   glVertex3f(4, 0.032f, FER_Z + 2);   glVertex3f(18, 0.032f, FER_Z + 2); glVertex3f(18, 0.032f, FER_Z - 2);
+    glEnd();
+    // plazas
+    col(0.66f, 0.58f, 0.46f);
+    glPushMatrix(); glTranslatef(CAR_X, 0.035f, CAR_Z); glRotatef(-90, 1, 0, 0); gluDisk(Q, 0, 12.5, 48, 1); glPopMatrix();
+    glPushMatrix(); glTranslatef(FER_X, 0.035f, FER_Z); glRotatef(-90, 1, 0, 0); gluDisk(Q, 0, 15, 48, 1); glPopMatrix();
+    glPushMatrix(); glTranslatef(0, 0.035f, TENT_Z + 2); glRotatef(-90, 1, 0, 0); gluDisk(Q, 0, 17, 48, 1); glPopMatrix();
+    // red carpet in front of the entrance
+    col(0.65f, 0.08f, 0.12f);
+    box(0, 0.04f, 25, 11.3f, 0.02f, 3.0f);
+    // curbs
+    col(0.75f, 0.75f, 0.78f);
+    box(-4.15f, 0.08f, -17, 0.25f, 0.16f, 120); box(4.15f, 0.08f, -17, 0.25f, 0.16f, 120);
+
+    // --- perimeter fence
+    fenceLine(-34, 25, -6.9f, 25);  fenceLine(6.9f, 25, 34, 25);
+    fenceLine(-34, 25, -34, -89);   fenceLine(34, 25, 34, -89);
+    fenceLine(-34, -89, 34, -89);
+
+    // --- flower beds along the path
+    for (int s = -1; s <= 1; s += 2)
+        for (int j = 0; j < 130; j++) {
+            float z = 58 - j * 0.95f;
+            if (fabsf(z - CAR_Z) < 2.5f && s < 0) continue;
+            if (fabsf(z - FER_Z) < 2.5f && s > 0) continue;
+            float x = s * (5.1f + frand(0, 1.3f));
+            int c = rand() % 8;
+            col(0.1f, 0.5f, 0.15f); sphere(x, 0.12f, z, 0.2f, 5, 4);
+            col(PAL[c][0], PAL[c][1], PAL[c][2]); sphere(x, 0.3f, z, 0.17f, 6, 5);
+        }
+
+    // --- trees (inside the park behind the shops + outside the fence)
+    int placed = 0, tries = 0;
+    while (placed < 130 && tries < 4000) {
+        tries++;
+        float x = frand(-70, 70), z = frand(-100, 75);
+        bool inside = fabsf(x) < 37 && z < 29 && z > -93;
+        if (inside) {
+            if (fabsf(x) < 15 || fabsf(x) > 32 || z > 20 || z < -86) continue;
+            if (hypotf(x - CAR_X, z - CAR_Z) < 15 || hypotf(x - FER_X, z - FER_Z) < 19 || hypotf(x, z - TENT_Z) < 15) continue;
+        } else {
+            if (fabsf(x) < 9 && z > 20) continue;                  // keep the approach clear
+            if (fabsf(x) < 38 && z < 30 && z > -94) continue;
+        }
+        trees.push_back({x, z});
+        int r = rand() % 10;
+        drawTree(x, z, frand(0.8f, 1.4f), r < 5 ? 0 : (r < 8 ? 1 : 2));
+        placed++;
+    }
+    glEndList();
+}
+
+// ------------------------------------------------------------ people
+struct Person {
+    float x, z, dir, speed, lane, phase, dist, spawn;
+    bool active;
+    float sh[3], pa[3], ha[3], sk[3];
+};
+static std::vector<Person> people;
+
+static void drawPerson(float x, float z, float yawDeg, float swing, const float* sh, const float* pa,
+                       const float* ha, const float* sk, float sc) {
+    glPushMatrix();
+    glTranslatef(x, 0, z); glRotatef(yawDeg, 0, 1, 0); glScalef(sc, sc, sc);
+    for (int s = -1; s <= 1; s += 2) {
+        glPushMatrix(); glTranslatef(s * 0.12f, 0.85f, 0); glRotatef(s * swing * 35, 1, 0, 0);
+        colv(pa);  box(0, -0.42f, 0, 0.17f, 0.85f, 0.2f);
+        col(0.1f, 0.1f, 0.1f); box(0, -0.85f, 0.05f, 0.18f, 0.1f, 0.3f);
+        glPopMatrix();
+    }
+    colv(sh); box(0, 1.15f, 0, 0.46f, 0.6f, 0.26f);
+    for (int s = -1; s <= 1; s += 2) {
+        glPushMatrix(); glTranslatef(s * 0.3f, 1.4f, 0); glRotatef(-s * swing * 30, 1, 0, 0);
+        colv(sh); box(0, -0.25f, 0, 0.12f, 0.5f, 0.14f);
+        colv(sk); box(0, -0.55f, 0, 0.1f, 0.12f, 0.12f);
+        glPopMatrix();
+    }
+    colv(sk); sphere(0, 1.62f, 0, 0.15f, 12, 10);
+    colv(ha); glPushMatrix(); glTranslatef(0, 1.69f, -0.02f); glScalef(1, 0.65f, 1); glutSolidSphere(0.16, 10, 8); glPopMatrix();
+    glPopMatrix();
+}
+
+static void initPeople() {
+    srand(77);
+    for (int i = 0; i < 26; i++) {
+        Person p;
+        p.lane = frand(-3.2f, 3.2f); p.z = frand(-58, 24); p.dir = (rand() & 1) ? 1.f : -1.f;
+        p.speed = frand(0.9f, 1.8f); p.phase = frand(0, 6.28f); p.dist = frand(0, 50); p.spawn = 0;
+        p.active = true; p.x = p.lane;
+        int c = rand() % 8, d = rand() % 8, k = rand() % 4;
+        for (int q = 0; q < 3; q++) {
+            p.sh[q] = PAL[c][q]; p.pa[q] = PAL[d][q] * 0.45f + 0.05f; p.sk[q] = SKIN[k][q];
+        }
+        float h = frand(0.05f, 0.5f); p.ha[0] = h; p.ha[1] = h * 0.7f; p.ha[2] = h * 0.4f;
+        people.push_back(p);
+    }
+}
+
+// ------------------------------------------------------------ balloons
+struct Balloon { float x, y, z, ph, sp, sz; float c[3]; };
+static std::vector<Balloon> balloons;
+static void initBalloons() {
+    srand(99);
+    for (int i = 0; i < 40; i++) {
+        Balloon b;
+        b.x = frand(-30, 30); b.z = frand(-84, 28); b.y = frand(8, 22);
+        b.ph = frand(0, 6.28f); b.sp = frand(0.7f, 1.4f); b.sz = frand(0.55f, 0.9f);
+        int c = rand() % 8; for (int q = 0; q < 3; q++) b.c[q] = PAL[c][q];
+        balloons.push_back(b);
+    }
+}
+static void drawBalloons() {
+    for (size_t i = 0; i < balloons.size(); i++) {
+        const Balloon& b = balloons[i];
+        float bx = b.x + 2.2f * sinf(balloonT * 0.25f * b.sp + b.ph);
+        float by = b.y + 1.6f * sinf(balloonT * 0.45f * b.sp + b.ph * 1.7f);
+        float bz = b.z + 2.2f * cosf(balloonT * 0.20f * b.sp + b.ph);
+        glPushMatrix(); glTranslatef(bx, by, bz);
+        colv(b.c);
+        glPushMatrix(); glScalef(1, 1.22f, 1); glutSolidSphere(b.sz, 16, 12); glPopMatrix();
+        glPushMatrix(); glTranslatef(0, -b.sz * 1.22f - 0.12f, 0); glRotatef(-90, 1, 0, 0);
+        glutSolidCone(0.11f, 0.2f, 8, 1); glPopMatrix();
+        glDisable(GL_LIGHTING); glColor3f(0.85f, 0.85f, 0.85f);
+        glBegin(GL_LINE_STRIP);
+        for (int k = 0; k <= 6; k++) {
+            float t = k / 6.0f;
+            glVertex3f(0.5f * t * sinf(balloonT + b.ph + t * 3), -b.sz * 1.22f - 0.2f - t * 5.0f, 0.5f * t * cosf(balloonT * 0.8f + b.ph));
+        }
+        glEnd();
+        glEnable(GL_LIGHTING);
+        glPopMatrix();
+    }
+}
+
+// ------------------------------------------------------------ shops
+static void drawShop(int idx) {
+    const Shop& s = shops[idx];
+    const float* c = PAL[s.c];
+    glPushMatrix();
+    glTranslatef(s.x, 0, s.z); glRotatef(s.rot, 0, 1, 0);
+    // floor, walls, roof
+    col(0.78f, 0.74f, 0.68f); box(0, 0.1f, 0.2f, 6.4f, 0.2f, 5.2f);
+    colv(c);                  box(0, 1.8f, -1.9f, 6, 3.2f, 0.2f);
+    col(c[0] * 0.8f, c[1] * 0.8f, c[2] * 0.8f);
+    box(-2.9f, 1.8f, 0, 0.2f, 3.2f, 4); box(2.9f, 1.8f, 0, 0.2f, 3.2f, 4);
+    col(0.25f, 0.2f, 0.25f);  box(0, 3.55f, 0, 6.6f, 0.25f, 4.8f);
+    // counter
+    col(0.55f, 0.36f, 0.2f);  box(0, 0.6f, 1.5f, 5.4f, 1.0f, 0.8f);
+    col(0.85f, 0.7f, 0.5f);   box(0, 1.15f, 1.5f, 5.6f, 0.1f, 1.0f);
+    // goods on counter
+    for (int i = 0; i < 7; i++) {
+        int k = (idx + i) % 8;
+        col(PAL[k][0], PAL[k][1], PAL[k][2]);
+        if (i & 1) sphere(-2.3f + i * 0.75f, 1.38f, 1.5f, 0.2f, 8, 6);
+        else       box(-2.3f + i * 0.75f, 1.33f, 1.5f, 0.35f, 0.3f, 0.35f);
+    }
+    // back shelves
+    col(0.45f, 0.3f, 0.18f);
+    box(0, 1.2f, -1.7f, 5.4f, 0.08f, 0.4f); box(0, 2.1f, -1.7f, 5.4f, 0.08f, 0.4f);
+    for (int i = 0; i < 9; i++) {
+        int k = (idx * 3 + i) % 8; col(PAL[k][0], PAL[k][1], PAL[k][2]);
+        box(-2.4f + i * 0.6f, 1.4f, -1.7f, 0.3f, 0.3f, 0.3f);
+        box(-2.4f + i * 0.6f, 2.3f, -1.7f, 0.3f, 0.3f, 0.3f);
+    }
+    // striped awning
+    for (int i = 0; i < 8; i++) {
+        glPushMatrix(); glTranslatef(-2.625f + i * 0.75f, 3.3f, 1.2f); glRotatef(25, 1, 0, 0);
+        if (i & 1) col(0.97f, 0.97f, 0.97f); else colv(c);
+        box(0, 0, 1.0f, 0.75f, 0.07f, 2.0f);
+        glPopMatrix();
+    }
+    col(0.85f, 0.85f, 0.88f);
+    upCyl(-2.9f, 0, 2.95f, 0.06f, 0.06f, 2.45f, 8); upCyl(2.9f, 0, 2.95f, 0.06f, 0.06f, 2.45f, 8);
+    // sign
+    col(0.08f, 0.08f, 0.16f); box(0, 4.35f, 2.0f, 5.2f, 1.0f, 0.14f);
+    glPushMatrix(); glTranslatef(0, 4.35f, 2.09f); signText(s.name, 4.6f, 0.7f, 1.0f, 0.92f, 0.55f); glPopMatrix();
+    // bulbs
+    for (int i = 0; i < 9; i++) {
+        int k = (i + idx) % 8;
+        float f = 0.8f + 0.2f * sinf(animT * 3 + i + idx);
+        bulb(-2.8f + i * 0.7f, 2.42f, 3.0f, PAL[k][0] * f, PAL[k][1] * f, PAL[k][2] * f, 0.09f);
+    }
+    for (int i = 0; i < 7; i++) bulb(-2.5f + i * 0.83f, 4.95f, 2.05f, 1, 0.85f, 0.5f, 0.08f);
+    glPopMatrix();
+
+    // vendor behind the counter (waves slowly)
+    float yawFace = s.rot;
+    float lx = s.x, lz = s.z;
+    float ca = cosf(s.rot * DEG), sa = sinf(s.rot * DEG);
+    lx += 0.6f * sa; lz += 0.6f * ca;                       // local (0,0,0.6) rotated about Y
+    float sw = 0.25f * sinf(animT * 1.6f + idx);
+    float sh[3] = {c[0], c[1], c[2]}, pa[3] = {0.2f, 0.2f, 0.3f}, ha[3] = {0.2f, 0.12f, 0.08f};
+    drawPerson(lx, lz, yawFace, sw, sh, pa, ha, SKIN[idx % 4], 1.0f);
+}
+
+// ------------------------------------------------------------ lamps & strings
+static void drawLamps() {
+    int zi = 0;
+    for (int z = 54; z >= -56; z -= 10, zi++) {
+        for (int s = -1; s <= 1; s += 2) {
+            col(0.12f, 0.2f, 0.16f);
+            upCyl(s * 4.5f, 0, (float)z, 0.1f, 0.07f, 4.5f, 8);
+            bulb(s * 4.5f, 4.75f, (float)z, 1.0f, 0.82f, 0.5f, 0.28f);
+        }
+        // string of coloured lights across the path
+        glDisable(GL_LIGHTING); col(0.05f, 0.05f, 0.05f);
+        glBegin(GL_LINE_STRIP);
+        for (int k = 0; k <= 12; k++) { float t = k / 12.0f; glVertex3f(mixf(-4.5f, 4.5f, t), 4.4f - 0.9f * 4 * t * (1 - t), (float)z); }
+        glEnd();
+        glEnable(GL_LIGHTING);
+        for (int k = 1; k < 9; k++) {
+            float t = k / 9.0f; int c = (k + zi) % 8;
+            float f = 0.75f + 0.25f * sinf(animT * 3.0f + k * 1.3f + z);
+            bulb(mixf(-4.5f, 4.5f, t), 4.4f - 0.9f * 4 * t * (1 - t) - 0.1f, (float)z, PAL[c][0] * f, PAL[c][1] * f, PAL[c][2] * f, 0.1f);
+        }
+    }
+}
+
+// ------------------------------------------------------------ entrance gate
+static void drawGate() {
+    glPushMatrix(); glTranslatef(0, 0, 25);
+    for (int s = -1; s <= 1; s += 2) {
+        for (int i = 0; i < 4; i++) { if (i & 1) col(0.97f, 0.97f, 0.97f); else col(0.9f, 0.2f, 0.25f); box(s * 6.3f, 1.0f + i * 2.0f, 0, 1.3f, 2.0f, 1.3f); }
+        col(1.0f, 0.8f, 0.2f);
+        glPushMatrix(); glTranslatef(s * 6.3f, 8.0f, 0); glRotatef(-90, 1, 0, 0); glutSolidCone(1.2, 2.2, 12, 2); glPopMatrix();
+        sphere(s * 6.3f, 10.4f, 0, 0.25f, 10, 8);
+    }
+    col(1.0f, 0.8f, 0.2f); box(0, 8.4f, 0, 14, 1.0f, 1.2f);
+    col(0.08f, 0.08f, 0.26f); box(0, 10.9f, 0, 10.5f, 2.8f, 0.4f);
+    glPushMatrix(); glTranslatef(0, 10.9f, 0.23f); signText("CARNIVAL", 9.6f, 1.9f, 1.0f, 0.85f, 0.3f); glPopMatrix();
+    for (int i = -5; i <= 5; i++) {
+        int c = (i + 5) % 8;
+        bulb(i * 1.0f, 12.4f, 0.25f, PAL[c][0], PAL[c][1], PAL[c][2], 0.1f);
+        bulb(i * 1.0f, 9.4f, 0.25f, PAL[(c + 3) % 8][0], PAL[(c + 3) % 8][1], PAL[(c + 3) % 8][2], 0.1f);
+    }
+    // status board
+    col(0.3f, 0.3f, 0.3f); beam(-1.2f, 7.9f, 0, -1.2f, 7.4f, 0, 0.03f); beam(1.2f, 7.9f, 0, 1.2f, 7.4f, 0, 0.03f);
+    col(0.06f, 0.06f, 0.08f); box(0, 7.0f, 0, 3.2f, 0.9f, 0.14f);
+    glPushMatrix(); glTranslatef(0, 7.0f, 0.09f);
+    if (carnivalOpen) signText("OPEN", 2.6f, 0.65f, 0.3f, 1.0f, 0.4f); else signText("CLOSED", 2.8f, 0.65f, 1.0f, 0.25f, 0.2f);
+    glPopMatrix();
+    // swinging doors
+    for (int s = -1; s <= 1; s += 2) {
+        glPushMatrix(); glTranslatef(s * 5.6f, 0, 0); glRotatef(s < 0 ? gateAng : -gateAng, 0, 1, 0);
+        col(0.85f, 0.62f, 0.18f);
+        box(-s * 2.8f, 0.3f, 0, 5.4f, 0.2f, 0.12f); box(-s * 2.8f, 3.1f, 0, 5.4f, 0.2f, 0.12f);
+        for (int k = 0; k < 9; k++) box(-s * (0.3f + k * 0.6f), 1.7f, 0, 0.08f, 2.9f, 0.08f);
+        col(0.9f, 0.2f, 0.25f); sphere(-s * 5.4f, 3.3f, 0, 0.16f, 8, 6);
+        glPopMatrix();
+    }
+    glPopMatrix();
+}
+
+// ------------------------------------------------------------ carousel
+static void drawHorse(float y0, const float* c) {
+    colv(c);
+    box(0, y0, 0, 0.5f, 0.6f, 1.3f);
+    glPushMatrix(); glTranslatef(0, y0 + 0.5f, 0.6f); glRotatef(30, 1, 0, 0); box(0, 0, 0, 0.25f, 0.7f, 0.3f); glPopMatrix();
+    box(0, y0 + 0.9f, 0.95f, 0.24f, 0.3f, 0.5f);
+    col(0.15f, 0.1f, 0.08f); box(0, y0 + 0.85f, 0.45f, 0.08f, 0.5f, 0.3f);           // mane
+    glPushMatrix(); glTranslatef(0, y0 + 0.1f, -0.75f); glRotatef(-20, 1, 0, 0); box(0, -0.2f, 0, 0.1f, 0.6f, 0.12f); glPopMatrix();
+    colv(c);
+    for (int a = -1; a <= 1; a += 2) for (int b = -1; b <= 1; b += 2) box(a * 0.15f, y0 - 0.5f, b * 0.5f, 0.12f, 0.6f, 0.12f);
+    col(0.9f, 0.1f, 0.2f); box(0, y0 + 0.32f, 0.05f, 0.56f, 0.06f, 0.5f);           // saddle
+}
+static void drawCarousel() {
+    glPushMatrix(); glTranslatef(CAR_X, 0, CAR_Z);
+    col(0.55f, 0.35f, 0.2f); upCyl(0, 0, 0, 8.2f, 8.2f, 0.6f, 40);
+    col(0.9f, 0.75f, 0.3f);  upCyl(0, 0.6f, 0, 8.4f, 8.4f, 0.12f, 40);
+    for (int i = 0; i < 24; i++) {
+        float a = i * 15 * DEG; int c = (i + (int)(carAng / 15)) % 8;
+        bulb(8.4f * cosf(a), 0.45f, 8.4f * sinf(a), PAL[c][0], PAL[c][1], PAL[c][2], 0.1f);
+    }
+    glPushMatrix(); glTranslatef(0, 0.7f, 0); glRotatef(carAng, 0, 1, 0);
+    // centre pole + mirrored column
+    col(0.95f, 0.85f, 0.4f); upCyl(0, 0, 0, 1.1f, 1.1f, 6.3f, 20);
+    for (int i = 0; i < 6; i++) { col(0.9f, 0.2f, 0.3f); box(0, 0.5f + i * 1.0f, 0, 0.1f, 0.1f, 2.4f); }
+    // roof
+    col(0.95f, 0.8f, 0.3f); upCyl(0, 6.2f, 0, 8.6f, 8.6f, 0.35f, 40);
+    const int N = 16; const float rb = 9.2f, y0 = 6.55f, y1 = 10.8f;
+    glBegin(GL_TRIANGLES);
+    for (int i = 0; i < N; i++) {
+        float a0 = i * 2 * PI / N, a1 = (i + 1) * 2 * PI / N, am = (a0 + a1) / 2;
+        if (i & 1) col(0.97f, 0.97f, 0.97f); else col(0.88f, 0.15f, 0.3f);
+        float nh = y1 - y0; glNormal3f(cosf(am) * nh, rb, sinf(am) * nh);
+        glVertex3f(0, y1, 0); glVertex3f(rb * cosf(a0), y0, rb * sinf(a0)); glVertex3f(rb * cosf(a1), y0, rb * sinf(a1));
+    }
+    glEnd();
+    col(1.0f, 0.85f, 0.2f); sphere(0, y1 + 0.3f, 0, 0.4f, 12, 10);
+    for (int i = 0; i < 24; i++) {
+        float a = i * 15 * DEG; int c = (i * 3 + (int)(animT * 4)) % 8;
+        bulb(8.7f * cosf(a), 6.15f, 8.7f * sinf(a), PAL[c][0], PAL[c][1], PAL[c][2], 0.11f);
+    }
+    // horses on poles
+    static const float HC[6][3] = {{0.97f, 0.97f, 0.97f}, {0.6f, 0.38f, 0.2f}, {1.0f, 0.6f, 0.75f}, {0.4f, 0.7f, 0.95f}, {0.95f, 0.8f, 0.3f}, {0.55f, 0.4f, 0.8f}};
+    for (int i = 0; i < 12; i++) {
+        float a = i * 30 * DEG, r = (i & 1) ? 5.2f : 6.8f;
+        float bob = 0.55f * sinf((carAng * 2.5f + i * 60 + ((i & 1) ? 180 : 0)) * DEG);
+        glPushMatrix(); glTranslatef(r * cosf(a), 0, r * sinf(a)); glRotatef(-i * 30.0f, 0, 1, 0);
+        col(0.95f, 0.85f, 0.4f); upCyl(0, 0, 0, 0.07f, 0.07f, 6.2f, 8);
+        drawHorse(2.4f + bob, HC[i % 6]);
+        glPopMatrix();
+    }
+    glPopMatrix();
+    glPopMatrix();
+}
+
+// ------------------------------------------------------------ ferris wheel
+static void drawFerris() {
+    const float H = 16, R = 13;
+    glPushMatrix(); glTranslatef(FER_X, 0, FER_Z); glRotatef(90, 0, 1, 0);
+    col(0.85f, 0.87f, 0.95f);
+    for (int s = -1; s <= 1; s += 2) {
+        beam(-9, 0, s * 3.5f, 0, H, s * 1.7f, 0.3f);
+        beam(9, 0, s * 3.5f, 0, H, s * 1.7f, 0.3f);
+    }
+    beam(-9, 0.1f, -3.5f, -9, 0.1f, 3.5f, 0.2f); beam(9, 0.1f, -3.5f, 9, 0.1f, 3.5f, 0.2f);
+    beam(0, H, -2.4f, 0, H, 2.4f, 0.45f);
+    col(0.9f, 0.2f, 0.25f); sphere(0, H, 2.5f, 0.6f, 12, 10); sphere(0, H, -2.5f, 0.6f, 12, 10);
+
+    glPushMatrix(); glTranslatef(0, H, 0); glRotatef(ferrisAng, 0, 0, 1);
+    for (int z = -1; z <= 1; z += 2) {
+        col(0.95f, 0.95f, 1.0f);
+        glPushMatrix(); glTranslatef(0, 0, z * 1.5f); glutSolidTorus(0.17, R, 8, 64); glPopMatrix();
+        glPushMatrix(); glTranslatef(0, 0, z * 1.5f); glutSolidTorus(0.1, R * 0.55, 6, 40); glPopMatrix();
+        for (int i = 0; i < 12; i++) {
+            float a = i * 30 * DEG;
+            col(0.85f, 0.85f, 0.95f); beam(0, 0, z * 1.5f, R * cosf(a), R * sinf(a), z * 1.5f, 0.08f);
+        }
+        for (int i = 0; i < 36; i++) {
+            float a = i * 10 * DEG; int c = (i + (int)(animT * 6)) % 8;
+            bulb(R * cosf(a), R * sinf(a), z * 1.75f, PAL[c][0], PAL[c][1], PAL[c][2], 0.1f);
+        }
+    }
+    for (int i = 0; i < 12; i++) {
+        float a = i * 30 * DEG;
+        glPushMatrix(); glTranslatef(R * cosf(a), R * sinf(a), 0); glRotatef(-ferrisAng, 0, 0, 1);
+        col(0.7f, 0.7f, 0.75f); beam(0, 0, -1.5f, 0, -0.9f, -1.1f, 0.05f); beam(0, 0, 1.5f, 0, -0.9f, 1.1f, 0.05f);
+        beam(0, -0.9f, -1.1f, 0, -0.9f, 1.1f, 0.05f);
+        col(PAL[i % 8][0], PAL[i % 8][1], PAL[i % 8][2]);
+        box(0, -1.7f, 0, 1.9f, 1.4f, 2.4f);
+        col(0.97f, 0.97f, 0.97f); box(0, -0.95f, 0, 2.2f, 0.12f, 2.7f);
+        col(0.75f, 0.9f, 1.0f); box(0, -1.6f, 0, 2.0f, 0.6f, 2.5f);                 // windows band
+        bulb(0, -1.0f, 0, 1.0f, 0.9f, 0.6f, 0.11f);
+        glPopMatrix();
+    }
+    glPopMatrix();
+    glPopMatrix();
+}
+
+// ------------------------------------------------------------ big top
+static void drawTent() {
+    const float R = 10, wallH = 5, rb = 11.3f, roofH = 8;
+    const int N = 24;
+    glPushMatrix(); glTranslatef(0, 0, TENT_Z);
+    glBegin(GL_QUADS);
+    for (int i = 0; i < N; i++) {
+        float a0 = i * 2 * PI / N, a1 = (i + 1) * 2 * PI / N, am = (a0 + a1) / 2;
+        if (i & 1) col(0.97f, 0.97f, 0.97f); else col(0.88f, 0.15f, 0.25f);
+        glNormal3f(cosf(am), 0, sinf(am));
+        glVertex3f(R * cosf(a0), 0, R * sinf(a0)); glVertex3f(R * cosf(a1), 0, R * sinf(a1));
+        glVertex3f(R * cosf(a1), wallH, R * sinf(a1)); glVertex3f(R * cosf(a0), wallH, R * sinf(a0));
+    }
+    glEnd();
+    glBegin(GL_TRIANGLES);
+    for (int i = 0; i < N; i++) {
+        float a0 = i * 2 * PI / N, a1 = (i + 1) * 2 * PI / N, am = (a0 + a1) / 2;
+        if (i & 1) col(0.97f, 0.97f, 0.97f); else col(0.25f, 0.3f, 0.85f);
+        glNormal3f(cosf(am) * roofH, rb, sinf(am) * roofH);
+        glVertex3f(0, wallH + roofH, 0);
+        glVertex3f(rb * cosf(a0), wallH, rb * sinf(a0)); glVertex3f(rb * cosf(a1), wallH, rb * sinf(a1));
+    }
+    glEnd();
+    col(0.9f, 0.9f, 0.9f); upCyl(0, wallH + roofH, 0, 0.12f, 0.12f, 3.0f, 8);
+    glDisable(GL_CULL_FACE);
+    col(1.0f, 0.2f, 0.3f);
+    float wave = sinf(animT * 4) * 0.25f;
+    glBegin(GL_TRIANGLES); glNormal3f(0, 0, 1);
+    glVertex3f(0, wallH + roofH + 3.0f, 0); glVertex3f(0, wallH + roofH + 2.0f, 0); glVertex3f(1.8f, wallH + roofH + 2.5f, wave);
+    glEnd();
+    // entrance
+    col(0.06f, 0.03f, 0.05f); box(0, 1.9f, R + 0.05f, 3.8f, 3.8f, 0.3f);
+    col(0.65f, 0.08f, 0.12f); box(0, 0.05f, R + 2.5f, 3.4f, 0.04f, 5.0f);
+    col(0.08f, 0.08f, 0.26f); box(0, 4.45f, R + 0.2f, 6.0f, 0.9f, 0.15f);
+    glPushMatrix(); glTranslatef(0, 4.45f, R + 0.3f); signText("BIG TOP", 5.4f, 0.7f, 1.0f, 0.85f, 0.3f); glPopMatrix();
+    for (int i = 0; i < 9; i++) bulb(-2.0f + i * 0.5f, 3.95f, R + 0.3f, PAL[i % 8][0], PAL[i % 8][1], PAL[i % 8][2], 0.09f);
+    for (int i = 0; i < 4; i++) {
+        bulb(-2.05f, 0.5f + i * 0.9f, R + 0.3f, 1, 0.8f, 0.4f, 0.09f); bulb(2.05f, 0.5f + i * 0.9f, R + 0.3f, 1, 0.8f, 0.4f, 0.09f);
+    }
+    for (int i = 0; i < N; i++) {
+        float a = i * 2 * PI / N; int c = (i + (int)(animT * 3)) % 8;
+        bulb(rb * cosf(a), wallH - 0.1f, rb * sinf(a), PAL[c][0], PAL[c][1], PAL[c][2], 0.12f);
+    }
+    if (glowLevel > 0.05f) addGlow(0, 1.9f, R + 0.6f, 1.0f, 0.65f, 0.25f, 0.6f);
+    glPopMatrix();
+}
+
+// ------------------------------------------------------------ sky
+static float starP[900][3], starPh[900];
+static struct Cloud { float x, y, z, s; } clouds[12];
+
+static void skyColors(float n, float* hor, float* zen) {
+    const float dz[3] = {0.20f, 0.46f, 0.88f}, dh[3] = {0.72f, 0.86f, 0.98f};
+    const float nz[3] = {0.004f, 0.008f, 0.045f}, nh[3] = {0.05f, 0.07f, 0.18f};
+    float dusk = sinf(PI * n);
+    for (int i = 0; i < 3; i++) { zen[i] = mixf(dz[i], nz[i], n); hor[i] = mixf(dh[i], nh[i], n); }
+    hor[0] += 0.45f * dusk; hor[1] += 0.17f * dusk; hor[2] -= 0.04f * dusk; zen[0] += 0.12f * dusk;
+    for (int i = 0; i < 3; i++) { hor[i] = clamp01(hor[i]); zen[i] = clamp01(zen[i]); }
+}
+
+static const float SUN_D[3]  = {0.45f, 0.50f, -0.74f};
+static const float MOON_D[3] = {-0.38f, 0.52f, -0.76f};
+
+static void drawBody(const float* d, float rad, float r, float g, float b, float alpha, bool moon) {
+    float L = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    float dx = d[0] / L, dy = d[1] / L, dz = d[2] / L;
+    glPushMatrix(); glTranslatef(dx * 450, dy * 450, dz * 450);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    for (int i = 0; i < 12; i++) {                           // soft halo: many faint layers
+        float t = i / 11.0f;
+        glColor4f(r, g, b, 0.022f * alpha * (0.4f + t));
+        glutSolidSphere(rad * (3.6f - 2.5f * t), 24, 16);
+    }
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(r, g, b, alpha); glutSolidSphere(rad, 28, 20);
+    if (moon) {                                               // craters facing the viewer
+        glRotatef(atan2f(dx, dz) / DEG, 0, 1, 0); glRotatef(-asinf(dy) / DEG, 1, 0, 0);
+        static const float cr[6][3] = {{-0.3f, 0.25f, 0.2f}, {0.35f, 0.1f, 0.15f}, {0.05f, -0.35f, 0.25f},
+                                       {-0.45f, -0.2f, 0.12f}, {0.4f, -0.4f, 0.1f}, {0.1f, 0.5f, 0.12f}};
+        glColor4f(0.72f, 0.74f, 0.80f, alpha);
+        for (int i = 0; i < 6; i++) {
+            float cx = cr[i][0] * rad, cy = cr[i][1] * rad, cs = cr[i][2] * rad;
+            float cz = -sqrtf(std::max(0.0f, rad * rad - cx * cx - cy * cy)) * 0.985f;
+            glPushMatrix(); glTranslatef(cx, cy, cz); glScalef(1, 1, 0.25f); glutSolidSphere(cs, 12, 8); glPopMatrix();
+        }
+    }
+    glPopMatrix();
+}
+
+static void drawSky(const float* hor, const float* zen) {
+    glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
+    glPushMatrix(); glTranslatef(camX, eyeH, camZ);
+    const int SL = 14, SG = 36; const float R = 600;
+    for (int i = 0; i < SL; i++) {
+        float lat0 = -10 + i * 100.0f / SL, lat1 = -10 + (i + 1) * 100.0f / SL;
+        glBegin(GL_QUAD_STRIP);
+        for (int j = 0; j <= SG; j++) {
+            float lon = j * 2 * PI / SG;
+            for (int k = 0; k < 2; k++) {
+                float lat = (k == 0 ? lat1 : lat0) * DEG;
+                float t = powf(std::max(0.0f, sinf(lat)), 0.45f);
+                glColor3f(mixf(hor[0], zen[0], t), mixf(hor[1], zen[1], t), mixf(hor[2], zen[2], t));
+                glVertex3f(R * cosf(lat) * sinf(lon), R * sinf(lat), -R * cosf(lat) * cosf(lon));
+            }
+        }
+        glEnd();
+    }
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (night > 0.03f) {                                          // stars
+        for (int pass = 0; pass < 2; pass++) {
+            glPointSize(pass ? 3.0f : 1.6f);
+            glBegin(GL_POINTS);
+            for (int i = 0; i < 900; i++) {
+                if ((i % 9 == 0) != (pass == 1)) continue;
+                float tw = 0.65f + 0.35f * sinf(animT * (1.0f + (i % 5) * 0.4f) + starPh[i]);
+                float a = night * tw * clamp01(starP[i][1] / 120.0f + 0.1f);
+                glColor4f(0.85f + 0.15f * (i % 3 == 0), 0.9f, 1.0f - 0.2f * (i % 4 == 0), a);
+                glVertex3f(starP[i][0], starP[i][1], starP[i][2]);
+            }
+            glEnd();
+        }
+    }
+    if (night > 0.03f) drawBody(MOON_D, 26, 0.96f, 0.96f, 0.88f, smooth(night), true);
+    if (night < 0.97f) drawBody(SUN_D, 30, 1.0f, 0.93f, 0.55f, smooth(1 - night), false);
+    glPopMatrix();
+    glEnable(GL_DEPTH_TEST);
+    if (night < 0.95f) {                                          // clouds (day)
+        static const float off[6][4] = {{0, 0, 0, 1.0f}, {1.2f, 0.2f, 0.3f, 0.8f}, {-1.3f, 0.1f, -0.2f, 0.85f},
+                                        {0.4f, 0.4f, -0.5f, 0.7f}, {2.2f, -0.1f, 0.1f, 0.6f}, {-2.3f, -0.1f, 0.2f, 0.6f}};
+        float a = 0.92f * (1 - night);
+        for (int c = 0; c < 12; c++) {
+            float cx = fmodf(clouds[c].x + animT * 1.6f + 500.0f, 1000.0f) - 500.0f;
+            for (int p = 0; p < 6; p++) {
+                glColor4f(mixf(1.0f, hor[0] * 1.2f, 0.3f), mixf(1.0f, hor[1] * 1.2f, 0.3f), mixf(1.0f, hor[2] * 1.2f, 0.3f), a);
+                glPushMatrix();
+                glTranslatef(cx + off[p][0] * clouds[c].s, clouds[c].y + off[p][1] * clouds[c].s, clouds[c].z + off[p][2] * clouds[c].s);
+                glScalef(1.0f, 0.42f, 0.7f); glutSolidSphere(clouds[c].s * off[p][3], 12, 8);
+                glPopMatrix();
+            }
+        }
+    }
+    glDisable(GL_BLEND); glDepthMask(GL_TRUE);
+}
+
+// ------------------------------------------------------------ HUD
+static void text2D(float x, float y, const char* s, void* font = GLUT_BITMAP_9_BY_15) {
+    glRasterPos2f(x, y);
+    for (; *s; s++) glutBitmapCharacter(font, *s);
+}
+static void drawHUD() {
+    glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_DEPTH_TEST);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); gluOrtho2D(0, winW, 0, winH);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    char buf[160];
+    float k = night > 0.5f ? 1.0f : 0.1f;
+    glColor3f(k, k, k * 0.9f + 0.1f);
+    snprintf(buf, sizeof buf, "%s  |  Carnival: %s  |  %s", night > 0.5f ? "NIGHT" : "DAY",
+             carnivalOpen ? (power < 0.98f ? "opening..." : "OPEN") : (power > 0.02f ? "shutting down..." : "CLOSED"),
+             paused ? "PAUSED" : "running");
+    text2D(12, winH - 22.0f, buf);
+    if (showHelp) {
+        const char* L[] = {"W A S D  walk (SHIFT run)   Arrows  look   Mouse wheel  glide   M  mouse-look",
+                           "N  day/night   P / SPACE  pause   C  close/reopen carnival   Q/E  fly   R  reset   H  hide help"};
+        for (int i = 0; i < 2; i++) text2D(12, 28.0f - i * 18.0f, L[i], GLUT_BITMAP_8_BY_13);
+    }
+    if (paused) { glColor3f(1, 0.85f, 0.3f); text2D(winW / 2 - 45.0f, winH / 2 + 80.0f, "|| PAUSED", GLUT_BITMAP_HELVETICA_18); }
+    if (!carnivalOpen && power < 0.3f) { glColor3f(1, 0.35f, 0.3f); text2D(winW / 2 - 105.0f, winH / 2 + 110.0f, "THE CARNIVAL IS CLOSED  -  press C to reopen", GLUT_BITMAP_HELVETICA_18); }
+    glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+    glEnable(GL_DEPTH_TEST);
+}
+
+// ------------------------------------------------------------ update
+static void tryMove(float nx, float nz) {
+    nx = std::max(-75.0f, std::min(75.0f, nx)); nz = std::max(-100.0f, std::min(80.0f, nz));
+    bool ghost = eyeH > 7.0f;                                  // flying: ignore obstacles
+    if (ghost || !solid(nx, camZ, camX, camZ)) camX = nx;
+    if (ghost || !solid(camX, nz, camX, camZ)) camZ = nz;
+}
+
+static void update(float dt) {
+    // smooth transitions (run even while paused so N and C stay responsive)
+    float nt = nightTarget ? 1.0f : 0.0f;
+    night += (nt - night) * std::min(1.0f, dt * 1.2f);
+    if (fabsf(nt - night) < 0.003f) night = nt;
+    float pt = carnivalOpen ? 1.0f : 0.0f, step = dt * 0.35f;
+    power += std::max(-step, std::min(step, pt - power));
+    lamp = power * (0.3f + 0.7f * night);
+    glowLevel = power * smooth(night * 1.1f);
+
+    int inside = 0;
+    for (size_t i = 0; i < people.size(); i++) if (people[i].active && people[i].z < 25 && people[i].z > -82) inside++;
+    bool wantOpen = carnivalOpen;
+    if (!carnivalOpen) { closeTimer += dt; wantOpen = (inside > 0 && closeTimer < 40.0f); }
+    float gt = wantOpen ? 100.0f : 0.0f, gs = 50 * dt;
+    gateAng += std::max(-gs, std::min(gs, gt - gateAng));
+
+    if (!paused) {
+        animT += dt;
+        ferrisAng += 8.0f * power * dt;
+        carAng += 22.0f * power * dt;
+        balloonT += dt * (0.5f + 0.5f * power);
+        for (size_t i = 0; i < people.size(); i++) {
+            Person& p = people[i];
+            if (!p.active) {
+                if (carnivalOpen && gateAng > 80) { p.spawn -= dt; if (p.spawn <= 0) { p.active = true; p.z = 32; p.dir = -1; } }
+                continue;
+            }
+            if (!carnivalOpen) p.dir = 1;
+            else { if (p.z < -58) p.dir = 1; if (p.z > 24 && p.z < 30) p.dir = -1; }
+            float sp = p.speed * (carnivalOpen ? 1.0f : 2.2f);
+            p.z += p.dir * sp * dt; p.dist += sp * dt;
+            p.x = p.lane + 0.45f * sinf(p.dist * 0.35f + p.phase);
+            if (!carnivalOpen && p.z > 34) p.active = false;
+        }
+    }
+
+    // camera
+    float sp = shiftHeld ? 11.0f : 5.5f;
+    float fx = sinf(yaw * DEG), fz = -cosf(yaw * DEG), rx = cosf(yaw * DEG), rz = sinf(yaw * DEG);
+    float mx = 0, mz = 0;
+    if (keys['w']) { mx += fx; mz += fz; }
+    if (keys['s']) { mx -= fx; mz -= fz; }
+    if (keys['d']) { mx += rx; mz += rz; }
+    if (keys['a']) { mx -= rx; mz -= rz; }
+    float ml = sqrtf(mx * mx + mz * mz); if (ml > 1) { mx /= ml; mz /= ml; }
+    float dx = (mx * sp + fx * scrollV) * dt, dz = (mz * sp + fz * scrollV) * dt;
+    scrollV *= expf(-3.0f * dt);
+    if (fabsf(dx) + fabsf(dz) > 1e-6f) tryMove(camX + dx, camZ + dz);
+    if (sKeys[0]) yaw -= 90 * dt;
+    if (sKeys[1]) yaw += 90 * dt;
+    if (sKeys[2]) pitch += 60 * dt;
+    if (sKeys[3]) pitch -= 60 * dt;
+    pitch = std::max(-85.0f, std::min(85.0f, pitch));
+    if (keys['e']) eyeH += 8 * dt;
+    if (keys['q']) eyeH -= 8 * dt;
+    eyeH = std::max(1.7f, std::min(60.0f, eyeH));
+}
+
+// ------------------------------------------------------------ render
+static void display() {
+    int ms = glutGet(GLUT_ELAPSED_TIME);
+    float dt = (ms - lastMs) / 1000.0f; lastMs = ms; if (dt > 0.05f) dt = 0.05f; if (dt < 0) dt = 0;
+    update(dt);
+
+    float hor[3], zen[3]; skyColors(night, hor, zen);
+    glClearColor(hor[0], hor[1], hor[2], 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    float py = pitch * DEG, yw = yaw * DEG;
+    gluLookAt(camX, eyeH, camZ, camX + cosf(py) * sinf(yw), eyeH + sinf(py), camZ - cosf(py) * cosf(yw), 0, 1, 0);
+
+    drawSky(hor, zen);
+
+    // lighting: sun by day, moon by night
+    float L[3]; for (int i = 0; i < 3; i++) L[i] = mixf(SUN_D[i], MOON_D[i], night);
+    float ln = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
+    float lpos[4] = {L[0] / ln, L[1] / ln, L[2] / ln, 0};
+    float dif[4] = {mixf(1.0f, 0.42f, night), mixf(0.95f, 0.50f, night), mixf(0.85f, 0.78f, night), 1};
+    float amb[4] = {mixf(0.46f, 0.20f, night), mixf(0.48f, 0.23f, night), mixf(0.55f, 0.37f, night), 1};
+    glEnable(GL_LIGHTING); glEnable(GL_LIGHT0);
+    glLightfv(GL_LIGHT0, GL_POSITION, lpos); glLightfv(GL_LIGHT0, GL_DIFFUSE, dif); glLightfv(GL_LIGHT0, GL_AMBIENT, amb);
+    float gam[4] = {amb[0] * 0.5f, amb[1] * 0.5f, amb[2] * 0.5f, 1};
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, gam);
+
+    // fog = horizon colour
+    glEnable(GL_FOG); glFogi(GL_FOG_MODE, GL_LINEAR);
+    glFogf(GL_FOG_START, mixf(90.0f, 45.0f, night)); glFogf(GL_FOG_END, mixf(330.0f, 230.0f, night));
+    float fc[4] = {hor[0], hor[1], hor[2], 1}; glFogfv(GL_FOG_COLOR, fc);
+
+    glows.clear();
+    glCallList(staticList);
+    drawGate();
+    for (int i = 0; i < 12; i++) drawShop(i);
+    drawLamps();
+    drawCarousel();
+    drawFerris();
+    drawTent();
+    for (size_t i = 0; i < people.size(); i++) {
+        const Person& p = people[i];
+        if (!p.active) continue;
+        drawPerson(p.x, p.z, p.dir < 0 ? 180.0f : 0.0f, sinf(p.dist * 3.2f), p.sh, p.pa, p.ha, p.sk, 1.0f);
+    }
+    drawBalloons();
+    drawGlows();
+    drawHUD();
+    glutSwapBuffers();
+}
+
+// ------------------------------------------------------------ input
+static void resetCam() { camX = 0; camZ = 52; eyeH = 1.7f; yaw = 0; pitch = -3; scrollV = 0; }
+
+static void keyDown(unsigned char k, int, int) {
+    shiftHeld = (glutGetModifiers() & GLUT_ACTIVE_SHIFT) != 0;
+    int c = tolower(k);
+    keys[c] = true;
+    switch (c) {
+    case 27: exit(0);
+    case 'p': case ' ': paused = !paused; break;
+    case 'n': nightTarget = !nightTarget; break;
+    case 'h': showHelp = !showHelp; break;
+    case 'r': resetCam(); break;
+    case 'c':
+        carnivalOpen = !carnivalOpen;
+        if (carnivalOpen) { for (size_t i = 0; i < people.size(); i++) if (!people[i].active) people[i].spawn = frand(1.0f, 14.0f); }
+        else closeTimer = 0;
+        break;
+    case 'm':
+        mouseLook = !mouseLook;
+        glutSetCursor(mouseLook ? GLUT_CURSOR_NONE : GLUT_CURSOR_INHERIT);
+        if (mouseLook) { warping = true; glutWarpPointer(winW / 2, winH / 2); }
+        break;
+    case 'f':
+        fullScr = !fullScr;
+        if (fullScr) glutFullScreen(); else { glutReshapeWindow(1280, 720); glutPositionWindow(60, 40); }
+        break;
+    }
+}
+static void keyUp(unsigned char k, int, int) {
+    shiftHeld = (glutGetModifiers() & GLUT_ACTIVE_SHIFT) != 0;
+    keys[tolower(k)] = false;
+}
+static void specialDown(int k, int, int) {
+    if (k == GLUT_KEY_LEFT)  sKeys[0] = true;
+    if (k == GLUT_KEY_RIGHT) sKeys[1] = true;
+    if (k == GLUT_KEY_UP)    sKeys[2] = true;
+    if (k == GLUT_KEY_DOWN)  sKeys[3] = true;
+}
+static void specialUp(int k, int, int) {
+    if (k == GLUT_KEY_LEFT)  sKeys[0] = false;
+    if (k == GLUT_KEY_RIGHT) sKeys[1] = false;
+    if (k == GLUT_KEY_UP)    sKeys[2] = false;
+    if (k == GLUT_KEY_DOWN)  sKeys[3] = false;
+}
+static void mouseBtn(int button, int state, int, int) {
+    if (state != GLUT_DOWN) return;
+    if (button == 3) scrollV = std::min(scrollV + 7.0f, 24.0f);     // wheel up   -> glide forward
+    if (button == 4) scrollV = std::max(scrollV - 7.0f, -24.0f);    // wheel down -> glide back
+}
+static void mouseMove(int x, int y) {
+    if (!mouseLook) return;
+    if (warping) { warping = false; return; }
+    int cx = winW / 2, cy = winH / 2;
+    if (x == cx && y == cy) return;
+    yaw += (x - cx) * 0.12f; pitch -= (y - cy) * 0.12f;
+    pitch = std::max(-85.0f, std::min(85.0f, pitch));
+    warping = true; glutWarpPointer(cx, cy);
+}
+static void reshape(int w, int h) {
+    winW = w; winH = h > 0 ? h : 1;
+    glViewport(0, 0, winW, winH);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    gluPerspective(65.0, (double)winW / winH, 0.2, 1500.0);
+    glMatrixMode(GL_MODELVIEW);
+}
+static void timer(int) { glutPostRedisplay(); glutTimerFunc(16, timer, 0); }
+
+// ------------------------------------------------------------ init
+static void initScene() {
+    Q = gluNewQuadric(); gluQuadricNormals(Q, GLU_SMOOTH);
+    glEnable(GL_DEPTH_TEST); glEnable(GL_NORMALIZE); glShadeModel(GL_SMOOTH);
+    glEnable(GL_COLOR_MATERIAL); glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+    float spec[4] = {0.12f, 0.12f, 0.12f, 1};
+    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, spec); glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 24);
+    glHint(GL_FOG_HINT, GL_NICEST);
+    glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
+
+    srand(5);
+    for (int i = 0; i < 900; i++) {                      // stars on the upper hemisphere
+        float x, y, z, l;
+        do { x = frand(-1, 1); y = frand(0.02f, 1); z = frand(-1, 1); l = sqrtf(x * x + y * y + z * z); } while (l > 1 || l < 0.2f);
+        starP[i][0] = x / l * 540; starP[i][1] = y / l * 540; starP[i][2] = z / l * 540; starPh[i] = frand(0, 6.28f);
+    }
+    for (int i = 0; i < 12; i++) {
+        clouds[i].x = frand(-500, 500); clouds[i].y = frand(90, 150); clouds[i].z = frand(-420, 60); clouds[i].s = frand(14, 30);
+    }
+    buildStatic();
+    initPeople();
+    initBalloons();
+    lastMs = glutGet(GLUT_ELAPSED_TIME);
+}
+
+int main(int argc, char** argv) {
+    glutInit(&argc, argv);
+    unsigned int mode = GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH;
+#ifdef GLUT_MULTISAMPLE
+    mode |= GLUT_MULTISAMPLE;
+#endif
+    glutInitDisplayMode(mode);
+    glutInitWindowSize(winW, winH);
+    glutCreateWindow("3D Carnival");
+    initScene();
+    glutDisplayFunc(display); glutReshapeFunc(reshape);
+    glutKeyboardFunc(keyDown); glutKeyboardUpFunc(keyUp);
+    glutSpecialFunc(specialDown); glutSpecialUpFunc(specialUp);
+    glutMouseFunc(mouseBtn); glutPassiveMotionFunc(mouseMove); glutMotionFunc(mouseMove);
+    glutIgnoreKeyRepeat(1);
+    glutTimerFunc(16, timer, 0);
+    glutMainLoop();
+    return 0;
+}
